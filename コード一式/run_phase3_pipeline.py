@@ -50,7 +50,7 @@ def main():
     logger.info("=== フェーズ3 統合自動生成パイプライン 開始 ===")
 
     # INPUT_DIR を基準にファイルパスを構築
-    excel_path = INPUT_DIR / "成果報告日報_末永_2026_09_04-09_30.xlsx"
+    excel_path = INPUT_DIR / "成果報告日報_氏名_2026_09_04-09_30.xlsx"
 
     if not excel_path.exists():
         logger.error(f"入力Excelファイルが見つかりません: {excel_path.absolute()}")

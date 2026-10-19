@@ -45,7 +45,6 @@ def get_unique_filepath(output_dir: Path, base_name: str, extension: str = ".ppt
 def extract_name_from_filename(filename: str) -> str:
     """
     ファイル名から氏名を抽出する
-    例: "成果報告日報_末永_2026_09_04-09_30.xlsx" -> "末永"
     """
     parts = Path(filename).stem.split("_")
     if len(parts) >= 2:

@@ -142,7 +142,7 @@ class PPTXGenerator:
             run_text.font.bold = is_bold
             run_text.font.color.rgb = COLOR_TEXT_MAIN
 
-    def generate(self, summary_data: WorkbookSummarySchema, output_path: Union[str, Path], author_name: str = "末永") -> Path:
+    def generate(self, summary_data: WorkbookSummarySchema, output_path: Union[str, Path], author_name: str = "氏名") -> Path:
         prs = Presentation(str(self.template_path))
 
         while len(prs.slides) > 0:
@@ -170,7 +170,7 @@ class PPTXGenerator:
         # 所属 ＆ 氏名（idx: 15 の枠内に直下配置で描画）
         if 15 in [ph.placeholder_format.idx for ph in title_slide.placeholders]:
             dept_shape = title_slide.placeholders[15]
-            dept_shape.text = f"所属：エンジニアリング事業部\n氏名：{author_name or '末永'}"
+            dept_shape.text = f"所属：エンジニアリング事業部\n氏名：{author_name or '氏名'}"
             for p in dept_shape.text_frame.paragraphs:
                 p.font.name = FONT_JAPANESE
                 p.font.size = Pt(14)
