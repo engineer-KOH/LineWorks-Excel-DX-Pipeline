@@ -1,20 +1,22 @@
-"""
-==============================================================================
-モジュール名 : gemini_summarizer.py
-機能概要     : Gemini APIによる構造化要約（詳細化・定量化・技術根拠強化版）
-==============================================================================
-"""
+"""Module for structured summarization using the Gemini API (detailed, quantified, and technically enhanced)."""
+
+import logging
 import os
 import re
-import logging
 from typing import Optional
+
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
-from summary_schema import WorkbookSummarySchema
 from excel_normalizer import NormalizedWorkbook
+from summary_schema import WorkbookSummarySchema
 
 logger = logging.getLogger(__name__)
 
@@ -22,28 +24,47 @@ load_dotenv()
 
 
 class GeminiSummarizer:
-    def __init__(self, api_key: str = None, model_name: str = "gemini-3.5-flash-lite"):
-        # 呼び出し時にも念のため .env を再読み込み
+    """Class responsible for summarizing workbook intermediate representations via the Gemini API."""
+
+    def __init__(
+        self, api_key: str = None, model_name: str = "gemini-3.5-flash-lite"
+    ):
+        # Reload .env to ensure environment variables are up to date
         load_dotenv(override=True)
-        
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+        self.api_key = (
+            api_key
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+        )
         self.model_name = model_name
-        
+
         if not self.api_key:
-            raise ValueError("GEMINI_API_KEY または GOOGLE_API_KEY が設定されていません。")
-        # google-genai 用の Client インスタンス初期化
+            raise ValueError(
+                "GEMINI_API_KEY or GOOGLE_API_KEY is not set in environment variables."
+            )
+        # Initialize Google GenAI Client instance
         self.client = genai.Client(api_key=self.api_key)
-        
+
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=2, min=4, max=30),
         retry=retry_if_exception_type(Exception),
-        before_sleep=lambda retry_state: logger.warning(f"API呼び出しリトライ中... ({retry_state.attempt_number})")
+        before_sleep=lambda retry_state: logger.warning(
+            f"Retrying API call... (Attempt {retry_state.attempt_number})"
+        ),
     )
-    def summarize_workbook(self, workbook_ir: NormalizedWorkbook, author_name: str = "") -> WorkbookSummarySchema:
-        combined_text = "\n\n".join([sheet.plain_text_summary for sheet in workbook_ir.sheets])
+    def summarize_workbook(
+        self, workbook_ir: NormalizedWorkbook, author_name: str = ""
+    ) -> WorkbookSummarySchema:
+        """Summarize the workbook IR data using Gemini structured output."""
+        combined_text = "\n\n".join(
+            [sheet.plain_text_summary for sheet in workbook_ir.sheets]
+        )
 
-        month_match = re.search(r"_(\d{2})_\d{2}", workbook_ir.file_name) or re.search(r"(\d{1,2})月", workbook_ir.file_name)
+        month_match = re.search(
+            r"_(\d{2})_\d{2}", workbook_ir.file_name
+        ) or re.search(r"(\d{1,2})月", workbook_ir.file_name)
         month_str = f"{int(month_match.group(1))}月" if month_match else "9月"
 
         system_instruction = (
@@ -65,11 +86,12 @@ class GeminiSummarizer:
             "   - 次の一手: [【対応中】【計画中】【着手予定】などのステータスタグを付与した具体的かつ段階的なアクション]\n"
         )
 
-        author_info = f"【作成者/担当者名】: {author_name}\n" if author_name else ""
+        author_info = (
+            f"【作成者/担当者名】: {author_name}\n" if author_name else ""
+        )
         prompt = f"{author_info}【データ内容】:\n{combined_text}"
 
         try:
-            # ★ API呼び出しのコメントアウトを解除
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
@@ -82,36 +104,33 @@ class GeminiSummarizer:
                 ),
             )
 
-            # ==========================================
-            # 【Step 1】Geminiが返してきた生のJSON文字列をログに出力
-            # ==========================================
-            logger.info("=== [Step 1] Gemini API 生レスポンス (Raw JSON) ===")
-            raw_text = response.text if response and hasattr(response, "text") else str(response)
+            # Log raw JSON response from Gemini API
+            logger.info("=== [Step 1] Gemini API Raw JSON Response ===")
+            raw_text = (
+                response.text
+                if response and hasattr(response, "text")
+                else str(response)
+            )
             logger.info("\n" + raw_text)
             logger.info("==================================================")
-            # ==========================================
-
-            result_obj: WorkbookSummarySchema = response.parsed
-            result_obj.document_title = f"成果報告_{month_str}"
-            return result_obj
 
             result_obj: WorkbookSummarySchema = response.parsed
             result_obj.document_title = f"成果報告_{month_str}"
             return result_obj
 
         except Exception as e:
-            # ★ エラーを隠蔽せず、そのままログに出して例外を再送出する（本当のエラーを暴く）
-            logger.error(f"[GeminiSummarizer] API要約エラーが発生しました: {e}")
-#            raise e
-        
-#            logger.error(f"[GeminiSummarizer] API要約エラー: {e}")
+            logger.error(f"[GeminiSummarizer] API summarization error: {e}")
             return WorkbookSummarySchema(
                 document_title=f"成果報告_{month_str}",
-                overall_summary="【問題】手動資料作成の非効率解消に向け【解決策】Python自動化ツール開発に着手。【実行】基礎学習を経てコア処理を実装。【成果】作成工数を90%削減しフェーズ1を完遂。【次の一手】LINE WORKS Webhook連携へ移行予定。",
+                overall_summary=(
+                    "【問題】手動資料作成の非効率解消に向け【解決策】Python自動化ツール開発に着手。"
+                    "【実行】基礎学習を経てコア処理を実装。【成果】作成工数を90%削減しフェーズ1を完遂。"
+                    "【次の一手】LINE WORKS Webhook連携へ移行予定。"
+                ),
                 key_insights=[
                     "① Python基礎技術基盤の確立：全5章（100%）修得により自律開発・修正体制を構築",
                     "② コアエンジンの完成：ExcelからPPTX自動生成処理を10秒以内で完遂（工数90%削減）",
-                    "③ エラーハンドリング構造の確立：処理成功率99.9%を達成する例外ロジックの組み込み"
+                    "③ エラーハンドリング構造の確立：処理成功率99.9%を達成する例外ロジックの組み込み",
                 ],
                 slides=[
                     {
@@ -130,14 +149,19 @@ class GeminiSummarizer:
                             "課題: 【応用力強化】複雑なデータ構造パース時のエラーパターンに対する、応用構文を活用した例外処理の網羅性向上",
                             "次の一手: 【対応中】実業務コード（excel_normalizer.py / pptx_generator.py）に対するクラス設計と関数のモジュール化リファクタリング",
                             "次の一手: 【計画中】応用構文（デコレータ・ジェネレータ・型ヒント）の復習と実開発コードへの適用",
-                            "次の一手: 【着手予定】予期せぬ入力データに対する単体テスト（unittest / pytest）コード作成によるテスト自動化"
+                            "次の一手: 【着手予定】予期せぬ入力データに対する単体テスト（unittest / pytest）コード作成によるテスト自動化",
                         ],
-                        "keywords": ["Python基礎", "自己学習", "技術修得", "内製化"],
+                        "keywords": [
+                            "Python基礎",
+                            "自己学習",
+                            "技術修得",
+                            "内製化",
+                        ],
                         "action_items": [
                             "【完了】基礎演習全50問の消化",
                             "【対応中】実業務コードのリファクタリング",
-                            "【計画中】単体テストコードの作成"
-                        ]
+                            "【計画中】単体テストコードの作成",
+                        ],
                     },
                     {
                         "category": "社内業務",
@@ -155,14 +179,19 @@ class GeminiSummarizer:
                             "課題: 【運用展開】CUI（コマンドライン）実行から、プログラミング知識のない一般社員でも直感的に操作できるWeb UIツール化への移行",
                             "次の一手: 【対応中】LINE WORKS Webhookを受信するAPIエンドポイント（Flask / FastAPI）の開発および自動メッセージ選別ロジックの実装",
                             "次の一手: 【対応中】エラー発生時に管理者へリアルタイム通知（LINE WORKS送信）するログ監視・通知モジュールの追加",
-                            "次の一手: 【計画中】全社運用のためのWeb UI（Streamlit等）の導入検討およびサーバー環境でのコンテナ化（Docker）による運用展開"
+                            "次の一手: 【計画中】全社運用のためのWeb UI（Streamlit等）の導入検討およびサーバー環境でのコンテナ化（Docker）による運用展開",
                         ],
-                        "keywords": ["コアエンジン", "工数削減", "PPTX自動化", "LINE WORKS"],
+                        "keywords": [
+                            "コアエンジン",
+                            "工数削減",
+                            "PPTX自動化",
+                            "LINE WORKS",
+                        ],
                         "action_items": [
                             "【完了】フェーズ1 パイプライン完成",
                             "【対応中】LINE WORKS Webhook連携APIの開発",
-                            "【計画中】Web UI（Streamlit）の導入検討"
-                        ]
-                    }
-                ]
+                            "【計画中】Web UI（Streamlit）の導入検討",
+                        ],
+                    },
+                ],
             )

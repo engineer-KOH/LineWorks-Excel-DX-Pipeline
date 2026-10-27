@@ -1,45 +1,36 @@
-"""
-Title: LINE WORKS Excel Webhook Bot (Main Server - Full Pipeline + Future Routing Ready)
-Description: 添付された日報Excelファイルを受信し、Excel正規化・Gemini要約・PPTX/JSON生成を完遂するAPIサーバー。
-             （将来の担当者自動ルーティング・通知機能用のコードをコメントアウトで同梱）
+"""LINE WORKS Excel Webhook Bot (Main Server - Full Pipeline + Future Routing Ready).
+
+Description: API server that receives attached report Excel files, executes normalization,
+             Gemini summarization, and generates PPTX/JSON.
 Version: 3.2.0 (Routing Prepared & Commented Out)
-
-【更新履歴 (Change Log)】
-- v1.0.0 (2026/09/10): 初期プロトタイプ作成（Webhook基本受信）
-- v2.0.0 (2026/09/14): HMAC-SHA256 署名検証および Pydantic 厳格バリデーションの導入
-- v2.1.0 (2026/09/15): バックグラウンドタスク内への openpyxl 解析パイプラインの統合
-- v2.2.0 (2026/09/15): Service Account (JWT/RS256) によるアクセストークン動的取得・File API連携
-- v2.2.4 (2026/09/17): リアルタイムフラッシュ対応カスタムロギングハンドラーの導入
-- v3.0.0 (2026/09/17): ローカル単独テストと同等の「Gemini API要約・JSON出力・テンプレートPPTX生成」パイプラインを完全統合
-- v3.1.0 (2026/09/17): Error Push Notification Integrated
-- v3.2.0 (2026/09/17): 将来の mapping.json 連携・担当者自動ルーティング用の準備コード（コメントアウト）を追加
 """
 
-import os
-import hmac
-import hashlib
+# Standard library imports
 import base64
+import hashlib
+import hmac
 import logging
-import time
-import urllib.parse
-from typing import Optional, Dict, List
+import os
 from pathlib import Path
-from fastapi import FastAPI, Request, Header, HTTPException, BackgroundTasks, status
-from pydantic import BaseModel
+import time
+import typing
+import urllib.parse
+
+# Third-party library imports
+from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
 import httpx
 import jwt  # PyJWT
-from dotenv import load_dotenv
+from pydantic import BaseModel
 
-# -------------------------------------------------------------------
-# 既存のコアモジュール・ユーティリティのインポート
-# -------------------------------------------------------------------
+# Local module imports
+from config import INPUT_DIR, OUTPUT_DIR, TEMPLATE_PATH
 from excel_normalizer import ExcelNormalizer
+from file_utils import extract_name_from_filename
 from gemini_summarizer import GeminiSummarizer
 from pptx_generator import PPTXGenerator
-from file_utils import extract_name_from_filename
-from config import INPUT_DIR, OUTPUT_DIR, TEMPLATE_PATH
 
-# 環境変数の読み込み
+# Load environment variables
 load_dotenv()
 
 LINEWORKS_SECRET_KEY = os.getenv("LINEWORKS_SECRET_KEY", "")
@@ -49,13 +40,17 @@ LINEWORKS_CLIENT_SECRET = os.getenv("LINEWORKS_CLIENT_SECRET", "")
 LINEWORKS_SERVICE_ACCOUNT = os.getenv("LINEWORKS_SERVICE_ACCOUNT", "")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "")
 
+
 # -------------------------------------------------------------------
-# ロギング設定（リアルタイムフラッシュ対応カスタムハンドラー）
+# Logging Setup (Custom handler supporting real-time flushing)
 # -------------------------------------------------------------------
 class FlushingFileHandler(logging.FileHandler):
+    """File handler that flushes log records immediately."""
+
     def emit(self, record):
         super().emit(record)
         self.flush()
+
 
 log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
@@ -79,74 +74,91 @@ logger.addHandler(stream_handler)
 
 app = FastAPI(
     title="LINE WORKS Excel Webhook Bot (Routing Prepared)",
-    description="LINE WORKS経由で受信した日報Excelを処理するAPIサーバー",
-    version="3.2.0"
+    description="API server to process report Excel files received via LINE WORKS.",
+    version="3.2.0",
 )
+
 
 # -------------------------------------------------------------------
 # Pydantic Schemas (LINE WORKS Payload Structure)
 # -------------------------------------------------------------------
 class Content(BaseModel):
+    """Schema for message content details."""
+
     type: str
-    fileId: Optional[str] = None
-    fileName: Optional[str] = None
-    text: Optional[str] = None
+    fileId: typing.Optional[str] = None
+    fileName: typing.Optional[str] = None
+    text: typing.Optional[str] = None
+
 
 class Source(BaseModel):
+    """Schema for event source details."""
+
     userId: str
 
+
 class LineWorksWebhookPayload(BaseModel):
+    """Schema for LINE WORKS incoming webhook payload."""
+
     type: str
     source: Source
-    createdTime: Optional[int] = None
+    createdTime: typing.Optional[int] = None
     content: Content
 
 
 # -------------------------------------------------------------------
-# セキュリティ: HMAC-SHA256 署名検証関数
+# Security: HMAC-SHA256 Signature Verification
 # -------------------------------------------------------------------
 def verify_signature(body: bytes, signature: str) -> bool:
+    """Verify HMAC-SHA256 signature from LINE WORKS webhook headers."""
     if not LINEWORKS_SECRET_KEY:
         return True
     hash_digest = hmac.new(
-        LINEWORKS_SECRET_KEY.encode('utf-8'),
-        body,
-        hashlib.sha256
+        LINEWORKS_SECRET_KEY.encode("utf-8"), body, hashlib.sha256
     ).digest()
-    expected_signature = base64.b64encode(hash_digest).decode('utf-8')
+    expected_signature = base64.b64encode(hash_digest).decode("utf-8")
     return hmac.compare_digest(expected_signature, signature)
 
 
 # -------------------------------------------------------------------
-# LINE WORKS 認証: JWT生成 & アクセストークン動的取得関数
+# LINE WORKS Authentication: JWT Generation & Access Token Dynamic Retrieval
 # -------------------------------------------------------------------
-# -------------------------------------------------------------------
-# LINE WORKS 認証: JWT生成 & アクセストークン動的取得関数 (.pemフォールバック対応)
-# -------------------------------------------------------------------
-LINEWORKS_PRIVATE_KEY_PATH = os.getenv("LINEWORKS_PRIVATE_KEY_PATH", "./system/private_key.pem")
+LINEWORKS_PRIVATE_KEY_PATH = os.getenv(
+    "LINEWORKS_PRIVATE_KEY_PATH", "./system/private_key.pem"
+)
 
-def get_lineworks_access_token() -> Optional[str]:
+
+def get_lineworks_access_token() -> typing.Optional[str]:
+    """Generate JWT, authenticate with LINE WORKS, and retrieve an access token."""
     token_url = "https://auth.worksmobile.com/oauth2/v2.0/token"
-    
-    # 1. まず環境変数 LINEWORKS_SECRET_KEY から秘密鍵を取得
+
+    # 1. Retrieve private key string from environment variable
     private_key_str = os.getenv("LINEWORKS_SECRET_KEY", "")
 
-    # 2. 環境変数が空、または不正な場合は .pem ファイルから読み込みを試みる
+    # 2. Fall back to loading from .pem file if environment variable is empty or invalid
     if not private_key_str or "BEGIN PRIVATE KEY" not in private_key_str:
         pem_path = Path(LINEWORKS_PRIVATE_KEY_PATH)
         if pem_path.exists():
             try:
                 private_key_str = pem_path.read_text(encoding="utf-8")
-                logger.info(f"[Token Key Loaded] .pemファイルから秘密鍵を読み込みました: {pem_path}")
+                logger.info(
+                    f"[Token Key Loaded] Loaded private key from .pem file: {pem_path}"
+                )
             except Exception as e:
-                logger.error(f"[Token Key Read Error] .pemファイルの読み込みに失敗しました: {e}")
+                logger.error(
+                    f"[Token Key Read Error] Failed to read .pem file: {e}"
+                )
                 return None
         else:
-            logger.error(f"[Token Check Fail] 秘密鍵が見つかりません。(env: False, pem_path: {pem_path.absolute()} False)")
+            logger.error(
+                f"[Token Check Fail] Private key not found (env: False, pem_path: {pem_path.absolute()} False)"
+            )
             return None
 
     if not LINEWORKS_CLIENT_ID or not LINEWORKS_SERVICE_ACCOUNT:
-        logger.error(f"[Token Check Fail] 必須環境変数が未設定です: CLIENT_ID={bool(LINEWORKS_CLIENT_ID)}, SERVICE_ACCOUNT={bool(LINEWORKS_SERVICE_ACCOUNT)}")
+        logger.error(
+            f"[Token Check Fail] Missing required env vars: CLIENT_ID={bool(LINEWORKS_CLIENT_ID)}, SERVICE_ACCOUNT={bool(LINEWORKS_SERVICE_ACCOUNT)}"
+        )
         return None
 
     current_time = int(time.time())
@@ -158,7 +170,9 @@ def get_lineworks_access_token() -> Optional[str]:
     }
 
     try:
-        encoded_jwt = jwt.encode(payload, private_key_str.strip(), algorithm="RS256")
+        encoded_jwt = jwt.encode(
+            payload, private_key_str.strip(), algorithm="RS256"
+        )
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         data = {
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
@@ -171,10 +185,14 @@ def get_lineworks_access_token() -> Optional[str]:
             response = client.post(token_url, headers=headers, data=data)
             if response.status_code == 200:
                 token = response.json().get("access_token")
-                logger.info("[Token Success] アクセストークンの動的取得に成功しました。")
+                logger.info(
+                    "[Token Success] Successfully retrieved access token."
+                )
                 return token
             else:
-                logger.error(f"[Token HTTP Error {response.status_code}]: {response.text}")
+                logger.error(
+                    f"[Token HTTP Error {response.status_code}]: {response.text}"
+                )
                 return None
     except Exception as e:
         logger.error(f"[Token JWT/RSA Error]: {e}", exc_info=True)
@@ -182,19 +200,23 @@ def get_lineworks_access_token() -> Optional[str]:
 
 
 # -------------------------------------------------------------------
-# エラー発生時のLINE WORKSプッシュ通知関数
+# Push Error Notification to LINE WORKS
 # -------------------------------------------------------------------
 async def send_line_works_error_notification(user_id: str, error_message: str):
+    """Send an error notification message to the user or admin via LINE WORKS bot API."""
     access_token = get_lineworks_access_token()
     if not access_token or not LINEWORKS_BOT_ID:
         return
     target_user_id = ADMIN_USER_ID if ADMIN_USER_ID else user_id
     api_url = f"https://www.worksapis.com/v1.0/bots/{LINEWORKS_BOT_ID}/users/{target_user_id}/messages"
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
     payload = {
         "content": {
             "type": "text",
-            "text": f"【⚠️ 日報自動処理 エラー通知】\nバックグラウンド処理中に例外が発生しました。\n\n詳細:\n{error_message}"
+            "text": f"【⚠️ 日報自動処理 エラー通知】\nバックグラウンド処理中に例外が発生しました。\n\n詳細:\n{error_message}",
         }
     }
     try:
@@ -203,129 +225,179 @@ async def send_line_works_error_notification(user_id: str, error_message: str):
     except Exception as e:
         logger.error(f"Error notification send failed: {e}")
 
+
 # -------------------------------------------------------------------
-# バックグラウンド処理: パイプライン実行
+# Background Task: Pipeline Execution
 # -------------------------------------------------------------------
 async def process_excel_attachment(
-    user_id: str, file_id: str, file_name: Optional[str], created_time: Optional[int]
+    user_id: str,
+    file_id: str,
+    file_name: typing.Optional[str],
+    created_time: typing.Optional[int],
 ):
-    logger.info(f"[Task Start] User: {user_id} | FileID: {file_id} | WebhookFileName: {file_name}")
-    
+    """Process downloaded Excel attachment through the normalization, summarization, and generation pipeline."""
+    logger.info(
+        f"[Task Start] User: {user_id} | FileID: {file_id} | WebhookFileName: {file_name}"
+    )
+
     INPUT_DIR.mkdir(exist_ok=True)
     OUTPUT_DIR.mkdir(exist_ok=True)
-    
+
     original_filename = file_name
     download_success = False
     access_token = get_lineworks_access_token()
     file_path = None
 
     if access_token:
-        file_api_url = f"https://www.worksapis.com/v1.0/bots/{LINEWORKS_BOT_ID}/attachments/{file_id}"
+        file_api_url = (
+            f"https://www.worksapis.com/v1.0/bots/{LINEWORKS_BOT_ID}/attachments/{file_id}"
+        )
         headers = {"Authorization": f"Bearer {access_token}"}
 
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(file_api_url, headers=headers, follow_redirects=False)
-                logger.info(f"File API Response Status: {response.status_code}")
-                
+                response = await client.get(
+                    file_api_url, headers=headers, follow_redirects=False
+                )
+                logger.info(
+                    f"File API Response Status: {response.status_code}"
+                )
+
                 if response.status_code in (301, 302, 303, 307, 308):
                     redirect_url = response.headers.get("Location")
                     if redirect_url:
-                        response = await client.get(redirect_url, headers=headers, follow_redirects=True)
-                        logger.info(f"Redirected File API Status: {response.status_code}")
-                        final_url_path = urllib.parse.urlparse(str(response.url)).path
-                        for part in final_url_path.split('/'):
+                        response = await client.get(
+                            redirect_url, headers=headers, follow_redirects=True
+                        )
+                        logger.info(
+                            f"Redirected File API Status: {response.status_code}"
+                        )
+                        final_url_path = urllib.parse.urlparse(
+                            str(response.url)
+                        ).path
+                        for part in final_url_path.split("/"):
                             decoded_part = urllib.parse.unquote(part)
-                            if decoded_part.endswith(('.xlsx', '.xls')):
+                            if decoded_part.endswith((".xlsx", ".xls")):
                                 original_filename = decoded_part
                                 break
 
                 if response.status_code == 200:
-                    resolved_name = original_filename or f"report_{file_id}.xlsx"
+                    resolved_name = (
+                        original_filename or f"report_{file_id}.xlsx"
+                    )
                     file_path = INPUT_DIR / resolved_name
                     with open(file_path, "wb") as f:
                         f.write(response.content)
-                    logger.info(f"実ファイルをローカルに保存しました: {file_path}")
+                    logger.info(
+                        f"Saved file locally to destination: {file_path}"
+                    )
                     download_success = True
                 else:
-                    # 200以外（401, 403, 404等）の場合にレスポンス本文を出力
-                    logger.error(f"File API エラーレスポンス [Status {response.status_code}]: {response.text}")
+                    logger.error(
+                        f"File API Error Response [Status {response.status_code}]: {response.text}"
+                    )
 
         except Exception as e:
-            # スタックトレースを含めて例外の詳細を出力
-            logger.error(f"APIダウンロード処理中に例外が発生しました: {e}", exc_info=True)
+            logger.error(
+                f"Exception occurred during file API download: {e}",
+                exc_info=True,
+            )
     else:
-        logger.error("アクセストークンの取得に失敗しているため、ダウンロード処理をスキップしました。")
-    
+        logger.error(
+            "Failed to retrieve access token; skipping download process."
+        )
+
     if not download_success or not file_path or not os.path.exists(file_path):
-        err_msg = "有効なExcelファイルのダウンロードに失敗しました。"
+        err_msg = "Failed to download a valid Excel file."
         logger.error(err_msg)
         await send_line_works_error_notification(user_id, err_msg)
         return
 
     try:
-        # 1. 氏名の抽出
+        # 1. Extract author name from filename
         author_name = extract_name_from_filename(file_path.name)
-        logger.info(f"ファイル名より氏名を抽出: '{author_name}'")
+        logger.info(f"Extracted author name from filename: '{author_name}'")
 
-        # 2. Excelファイルの正規化パース
-        logger.info("Step 1: Excelファイルの正規化パースを開始...")
+        # 2. Normalize and parse Excel file
+        logger.info("Step 1: Starting Excel normalization parsing...")
         normalizer = ExcelNormalizer(ignore_hidden_sheets=True)
         workbook_ir = normalizer.process_file(str(file_path))
 
-        # 3. Gemini APIによる構造化要約
-        logger.info("Step 2: Gemini APIによる構造化要約を開始...")
+        # 3. Generate structured summary using Gemini API
+        logger.info("Step 2: Starting Gemini API structured summarization...")
         summarizer = GeminiSummarizer()
-        summary_data = summarizer.summarize_workbook(workbook_ir, author_name=author_name)
-        
-        base_title = summary_data.document_title if "成果報告" in summary_data.document_title else "成果報告_9月"
+        summary_data = summarizer.summarize_workbook(
+            workbook_ir, author_name=author_name
+        )
+
+        base_title = (
+            summary_data.document_title
+            if "成果報告" in summary_data.document_title
+            else "成果報告_9月"
+        )
         if author_name and f"({author_name})" not in base_title:
             summary_data.document_title = f"{base_title} ({author_name})"
 
-        # 4. PPTXおよびJSONの自動生成
-        logger.info("Step 3: 同名ファイルでのPPTXおよびJSONの自動生成を開始...")
+        # 4. Automatically generate PPTX and JSON files
+        logger.info(
+            "Step 3: Starting automatic generation of PPTX and JSON files..."
+        )
         stem_name = file_path.stem
         output_pptx = OUTPUT_DIR / f"{stem_name}.pptx"
         output_json = OUTPUT_DIR / f"{stem_name}.json"
 
-        # スライドの並び順を「自己学習」→「社内業務」の順にソートする
+        # Sort slides by category order: Self-learning -> Internal operations
         category_order = {"自己学習": 1, "社内学習": 2, "社内業務": 3}
-        summary_data.slides.sort(key=lambda s: category_order.get(s.category, 99))
+        summary_data.slides.sort(
+            key=lambda s: category_order.get(s.category, 99)
+        )
 
         generator = PPTXGenerator(template_path=str(TEMPLATE_PATH))
-        generator.generate(summary_data, output_path=output_pptx, author_name=author_name)
+        generator.generate(
+            summary_data, output_path=output_pptx, author_name=author_name
+        )
 
-        output_json.write_text(summary_data.model_dump_json(indent=2, ensure_ascii=False), encoding="utf-8")
-        
-        logger.info(f"出力完了 -> PPTX: {output_pptx.name} / JSON: {output_json.name}")
-        logger.info(f"[Task Complete] パイプライン処理が正常終了しました。")
+        output_json.write_text(
+            summary_data.model_dump_json(indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
-       
+        logger.info(
+            f"Export completed -> PPTX: {output_pptx.name} / JSON: {output_json.name}"
+        )
+        logger.info("[Task Complete] Pipeline processing finished successfully.")
+
     except Exception as e:
         error_details = str(e)
-        logger.error(f"[Task Error] バックグラウンド処理中に例外が発生しました: {error_details}", exc_info=True)
+        logger.error(
+            f"[Task Error] Exception occurred during background processing: {error_details}",
+            exc_info=True,
+        )
         await send_line_works_error_notification(user_id, error_details)
 
 
 # -------------------------------------------------------------------
-# Webhook エンドポイント (HTTP POST)
+# Webhook Endpoint (HTTP POST)
 # -------------------------------------------------------------------
 @app.post("/webhook", status_code=status.HTTP_200_OK)
 async def handle_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
-    x_lineworks_signature: Optional[str] = Header(None)
+    x_lineworks_signature: typing.Optional[str] = Header(None),
 ):
+    """Receive incoming webhook events from LINE WORKS and trigger background processing if applicable."""
     body = await request.body()
-    if x_lineworks_signature and not verify_signature(body, x_lineworks_signature):
-        logger.error("不正な署名のリクエストを検出しました。")
+    if x_lineworks_signature and not verify_signature(
+        body, x_lineworks_signature
+    ):
+        logger.error("Detected request with invalid signature.")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     try:
         data = await request.json()
         payload = LineWorksWebhookPayload(**data)
     except Exception as e:
-        logger.error(f"JSONパースエラー: {e}")
+        logger.error(f"JSON parsing error: {e}")
         return {"status": "ignored", "reason": "invalid json format"}
 
     if payload.content.type == "file" and payload.content.fileId:
@@ -334,9 +406,14 @@ async def handle_webhook(
             user_id=payload.source.userId,
             file_id=payload.content.fileId,
             file_name=payload.content.fileName,
-            created_time=payload.createdTime
+            created_time=payload.createdTime,
         )
-        return {"status": "success", "message": "Excel file queued for full pipeline processing"}
+        return {
+            "status": "success",
+            "message": "Excel file queued for full pipeline processing",
+        }
 
-    logger.info(f"ファイル以外のメッセージタイプを受信（スキップ）: {payload.content.type}")
+    logger.info(
+        f"Received non-file message type (skipped): {payload.content.type}"
+    )
     return {"status": "ignored", "reason": "not a file message"}
